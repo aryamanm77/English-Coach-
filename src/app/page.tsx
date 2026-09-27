@@ -10,6 +10,7 @@ import Orb from '@/components/Orb';
 import SettingsSheet from '@/components/SettingsSheet';
 import { seedDatabase, db, Persona } from '@/lib/db';
 import { useLiveQuery } from 'dexie-react-hooks';
+import { saveSettingsToFirebase, loadSettingsFromFirebase } from '@/lib/firebase';
 
 const MODELS: Record<string, string> = {
   'Fast': 'Llama-3.2-1B-Instruct-q4f16_1-MLC', // Better, highly-supported small model
@@ -56,7 +57,25 @@ export default function Home() {
   useEffect(() => {
     synthRef.current = window.speechSynthesis;
     seedDatabase();
+    // Load settings from Firebase on first mount
+    loadSettingsFromFirebase().then((settings) => {
+      if (settings) {
+        if (settings.modelTier) setModelTier(settings.modelTier);
+        if (settings.selectedVoiceURI) setVoiceURI(settings.selectedVoiceURI);
+        if (settings.pushToTalk !== undefined) setIsPTT(settings.pushToTalk);
+      }
+    });
   }, []);
+
+  // Auto-save settings to Firebase whenever any setting changes
+  useEffect(() => {
+    saveSettingsToFirebase({
+      selectedPersona: activePersona?.name ?? 'English Coach',
+      selectedVoiceURI: voiceURI,
+      modelTier,
+      pushToTalk: isPTT,
+    });
+  }, [modelTier, voiceURI, isPTT, activePersona]);
 
   const handleSetup = async () => {
     setIsSettingUp(true);
