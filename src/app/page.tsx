@@ -22,6 +22,7 @@ type AppState = 'setup' | 'idle' | 'listening' | 'thinking' | 'speaking' | 'erro
 export default function Home() {
   const [appState, setAppState] = useState<AppState>('setup');
   const [loadingMsg, setLoadingMsg] = useState('Checking device capabilities...');
+  const [downloadProgress, setDownloadProgress] = useState(0);
   const [errorMsg, setErrorMsg] = useState('');
   
   const [modelTier, setModelTier] = useState<string>('Balanced');
@@ -81,6 +82,7 @@ export default function Home() {
       const engine = await CreateMLCEngine(selectedModel, {
         initProgressCallback: (info) => {
           setLoadingMsg(`LLM: ${info.text}`);
+          setDownloadProgress(info.progress * 100);
         }
       });
       engineRef.current = engine;
@@ -200,11 +202,22 @@ export default function Home() {
           <div className="pt-8">
             <button 
               onClick={handleSetup}
-              className="w-full py-4 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded-full font-medium transition-colors shadow-md"
+              disabled={downloadProgress > 0}
+              className="w-full py-4 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded-full font-medium transition-colors shadow-md disabled:opacity-50"
             >
-              Setup Models (~1.5GB)
+              {downloadProgress > 0 ? 'Downloading...' : 'Setup Models (~1.5GB)'}
             </button>
-            <p className="text-sm mt-4 text-[var(--foreground)] opacity-50">{loadingMsg}</p>
+            
+            {downloadProgress > 0 && (
+              <div className="w-full bg-[var(--surface-dark)] h-2 rounded-full mt-6 overflow-hidden">
+                <div 
+                  className="bg-[var(--accent)] h-full transition-all duration-300 ease-out"
+                  style={{ width: `${downloadProgress}%` }}
+                />
+              </div>
+            )}
+            
+            <p className="text-sm mt-4 text-[var(--foreground)] opacity-50 truncate">{loadingMsg}</p>
           </div>
         </div>
       </div>
