@@ -51,6 +51,12 @@ export const db = new AppDB();
 
 // Seed initial data
 export async function seedDatabase() {
+  const newCoachPrompt = `Act as my interactive, level-adaptive English coach. Follow these 4 rules:
+1. MATCH ME: Listen to my English and mirror my vocabulary level, grammar complexity, and speed.
+2. SHORT & CHATTY: Keep replies under 3 sentences and always end with one simple question.
+3. FIX ERRORS: Start your turn with "*Correction: Instead of [X], say [Y].*" if I make a mistake.
+4. START: Suggest 3 real-world practice topics (e.g., ordering food, work chat, travel) for me to pick from.`;
+
   const count = await db.personas.count();
   if (count === 0) {
     await db.personas.bulkAdd([
@@ -63,7 +69,7 @@ export async function seedDatabase() {
       {
         name: 'English Coach',
         icon: '📚',
-        systemPrompt: 'You are an English language coach. Correct my grammar gently, encourage practice, and speak in a clear, supportive tone.',
+        systemPrompt: newCoachPrompt,
         isCustom: false
       },
       {
@@ -73,5 +79,11 @@ export async function seedDatabase() {
         isCustom: false
       }
     ]);
+  } else {
+    // Force update the English coach prompt for existing users who already seeded
+    const coach = await db.personas.where('name').equals('English Coach').first();
+    if (coach && coach.id) {
+      await db.personas.update(coach.id, { systemPrompt: newCoachPrompt });
+    }
   }
 }
