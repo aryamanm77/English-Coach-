@@ -12,9 +12,9 @@ import { seedDatabase, db, Persona } from '@/lib/db';
 import { useLiveQuery } from 'dexie-react-hooks';
 
 const MODELS: Record<string, string> = {
-  'Fast': 'SmolLM-1.7B-Instruct-q4f16_1-MLC', // Fallback name for SmolLM2 if not found, usually models list changes
+  'Fast': 'Llama-3.2-1B-Instruct-q4f16_1-MLC', // Better, highly-supported small model
   'Balanced': 'Phi-3.5-mini-instruct-q4f16_1-MLC',
-  'Best': 'Llama-3-8B-Instruct-q4f32_1-MLC'
+  'Best': 'Llama-3.1-8B-Instruct-q4f32_1-MLC'
 };
 
 type AppState = 'setup' | 'idle' | 'listening' | 'thinking' | 'speaking' | 'error';
