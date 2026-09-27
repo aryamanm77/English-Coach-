@@ -23,6 +23,7 @@ export default function Home() {
   const [appState, setAppState] = useState<AppState>('setup');
   const [loadingMsg, setLoadingMsg] = useState('Checking device capabilities...');
   const [downloadProgress, setDownloadProgress] = useState(0);
+  const [isSettingUp, setIsSettingUp] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   
   const [modelTier, setModelTier] = useState<string>('Balanced');
@@ -58,6 +59,7 @@ export default function Home() {
   }, []);
 
   const handleSetup = async () => {
+    setIsSettingUp(true);
     try {
       setLoadingMsg('Requesting WebGPU access...');
       const nav = navigator as any;
@@ -108,6 +110,7 @@ export default function Home() {
     } catch (err: any) {
       setAppState('error');
       setErrorMsg(err.message);
+      setIsSettingUp(false);
     }
   };
 
@@ -202,13 +205,13 @@ export default function Home() {
           <div className="pt-8">
             <button 
               onClick={handleSetup}
-              disabled={downloadProgress > 0}
+              disabled={isSettingUp}
               className="w-full py-4 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded-full font-medium transition-colors shadow-md disabled:opacity-50"
             >
-              {downloadProgress > 0 ? 'Downloading...' : 'Setup Models (~1.5GB)'}
+              {isSettingUp ? 'Downloading...' : 'Setup Models (~1.5GB)'}
             </button>
             
-            {downloadProgress > 0 && (
+            {isSettingUp && (
               <div className="w-full bg-[var(--surface-dark)] h-2 rounded-full mt-6 overflow-hidden">
                 <div 
                   className="bg-[var(--accent)] h-full transition-all duration-300 ease-out"
