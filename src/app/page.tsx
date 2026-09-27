@@ -133,6 +133,8 @@ export default function Home() {
     }
   };
 
+  const conversationHistory = useRef<{ role: 'user' | 'model'; text: string }[]>([]);
+
   const handleTranscription = async (text: string) => {
     if (!text.trim()) {
       setAppState('idle');
@@ -140,40 +142,70 @@ export default function Home() {
     }
     
     setAppState('thinking');
-    
-    // Prepare prompt
-    const prompt = `System: ${activePersona?.systemPrompt || 'You are helpful.'}\nUser: ${text}\nAssistant:`;
-    
-    try {
-      const chunks = await engineRef.current.chat.completions.create({
-        messages: [{ role: 'user', content: prompt }],
-        stream: true,
-      });
-      
-      let fullReply = '';
+    const systemPrompt = activePersona?.systemPrompt || 'You are a helpful English coach.';
+
+    // Add user turn to history
+    conversationHistory.current.push({ role: 'user', text });
+
+    const geminiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+
+    if (geminiKey) {
+      // ── Gemini Cloud Path ──────────────────────────────────────────
+      const { streamGeminiResponse } = await import('@/lib/gemini');
       let sentenceBuffer = '';
       setAppState('speaking');
-      
-      for await (const chunk of chunks) {
-        if (appState === 'listening') break; // barge-in occurred
-        const token = chunk.choices[0]?.delta?.content || '';
-        fullReply += token;
-        sentenceBuffer += token;
-        
-        // Sentence boundary detection
-        if (/[.!?\n]\s/.test(sentenceBuffer)) {
-          speakSentence(sentenceBuffer.trim());
-          sentenceBuffer = '';
+
+      await streamGeminiResponse(
+        conversationHistory.current,
+        systemPrompt,
+        (token) => {
+          sentenceBuffer += token;
+          if (/[.!?\n]\s*/.test(sentenceBuffer)) {
+            const sentences = sentenceBuffer.split(/(?<=[.!?\n])\s+/);
+            for (let i = 0; i < sentences.length - 1; i++) {
+              if (sentences[i].trim()) speakSentence(sentences[i].trim());
+            }
+            sentenceBuffer = sentences[sentences.length - 1];
+          }
+        },
+        () => {
+          if (sentenceBuffer.trim()) speakSentence(sentenceBuffer.trim());
+          conversationHistory.current.push({ role: 'model', text: sentenceBuffer });
         }
+      );
+
+    } else {
+      // ── Local WebLLM Fallback ──────────────────────────────────────
+      try {
+        const prompt = `System: ${systemPrompt}\nUser: ${text}\nAssistant:`;
+        const chunks = await engineRef.current.chat.completions.create({
+          messages: [{ role: 'user', content: prompt }],
+          stream: true,
+        });
+        
+        let fullReply = '';
+        let sentenceBuffer = '';
+        setAppState('speaking');
+        
+        for await (const chunk of chunks) {
+          if (appState === 'listening') break;
+          const token = chunk.choices[0]?.delta?.content || '';
+          fullReply += token;
+          sentenceBuffer += token;
+          
+          if (/[.!?\n]\s/.test(sentenceBuffer)) {
+            speakSentence(sentenceBuffer.trim());
+            sentenceBuffer = '';
+          }
+        }
+        
+        if (sentenceBuffer.trim()) speakSentence(sentenceBuffer.trim());
+        conversationHistory.current.push({ role: 'model', text: fullReply });
+
+      } catch (err) {
+        console.error(err);
+        setAppState('idle');
       }
-      
-      if (sentenceBuffer.trim()) {
-        speakSentence(sentenceBuffer.trim());
-      }
-      
-    } catch (err) {
-      console.error(err);
-      setAppState('idle');
     }
   };
 
