@@ -1,373 +1,489 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { CreateMLCEngine } from '@mlc-ai/web-llm';
-import { Settings, Mic, Loader2, Info } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-
+import { Mic, MicOff, Settings, Zap, BookOpen, MessageSquare, X } from 'lucide-react';
 import { useAudioPipeline } from '@/lib/audioPipeline';
 import Orb from '@/components/Orb';
-import SettingsSheet from '@/components/SettingsSheet';
-import { seedDatabase, db, Persona } from '@/lib/db';
+import AIWave from '@/components/AIWave';
+import { seedDatabase, db } from '@/lib/db';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { saveSettingsToFirebase, loadSettingsFromFirebase } from '@/lib/firebase';
+import { streamGeminiResponse } from '@/lib/gemini';
 
-const MODELS: Record<string, string> = {
-  'Fast': 'Llama-3.2-1B-Instruct-q4f16_1-MLC', // Better, highly-supported small model
-  'Balanced': 'Phi-3.5-mini-instruct-q4f16_1-MLC',
-  'Best': 'Llama-3.1-8B-Instruct-q4f32_1-MLC'
-};
+type AppState = 'idle' | 'listening' | 'thinking' | 'speaking' | 'error';
 
-type AppState = 'setup' | 'idle' | 'listening' | 'thinking' | 'speaking' | 'error';
+interface Message {
+  role: 'user' | 'assistant';
+  text: string;
+  ts: number;
+}
+
+// Gemini's official TTS voice presets (for Gemini Live / TTS API)
+const GEMINI_VOICES = [
+  { id: 'Puck',   label: 'Puck',   desc: 'Upbeat & friendly' },
+  { id: 'Charon', label: 'Charon', desc: 'Clear & professional' },
+  { id: 'Kore',   label: 'Kore',   desc: 'Warm & calm' },
+  { id: 'Fenrir', label: 'Fenrir', desc: 'Deep & confident' },
+  { id: 'Aoede',  label: 'Aoede',  desc: 'Soft & natural' },
+  { id: 'Orbit',  label: 'Orbit',  desc: 'Bright & energetic' },
+  { id: 'Zephyr', label: 'Zephyr', desc: 'Smooth & clear' },
+];
+
+// Friendly alert messages (soft, never says "API limit")
+const REST_MESSAGES = [
+  "Your coach is taking a short breather 💙 Try again in a moment!",
+  "We're having a little rest to keep things smooth ✨ Be back shortly!",
+  "The coach is recharging — come back in a minute! 🌿",
+  "Too much great practice! Take a short break and we'll be right back 🎯",
+];
 
 export default function Home() {
-  const [appState, setAppState] = useState<AppState>('setup');
-  const [loadingMsg, setLoadingMsg] = useState('Checking device capabilities...');
-  const [downloadProgress, setDownloadProgress] = useState(0);
-  const [isSettingUp, setIsSettingUp] = useState(false);
+  const [appState, setAppState] = useState<AppState>('idle');
   const [errorMsg, setErrorMsg] = useState('');
-  
-  const [modelTier, setModelTier] = useState<string>('Balanced');
-  const [activePersonaId, setActivePersonaId] = useState<number>(1);
-  const [voiceURI, setVoiceURI] = useState<string>('');
-  const [isPTT, setIsPTT] = useState<boolean>(false);
-  
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [statusLabel, setStatusLabel] = useState('Tap the orb to start');
   const [showSettings, setShowSettings] = useState(false);
-  
-  const engineRef = useRef<any>(null);
-  const sttWorkerRef = useRef<Worker | null>(null);
-  
-  // Audio state
-  const { isListening, audioLevel, startListening, stopListening } = useAudioPipeline({
-    continuous: !isPTT,
-    onSilence: (audioBlob) => {
-      if (appState !== 'listening') return;
-      setAppState('thinking');
-      sttWorkerRef.current?.postMessage({ type: 'transcribe', audio: audioBlob });
-    }
-  });
+  const [selectedGeminiVoice, setSelectedGeminiVoice] = useState('Kore');
+  const [isPTT, setIsPTT] = useState(false);
+  const [restAlert, setRestAlert] = useState<string | null>(null);
+  const [requestCount, setRequestCount] = useState(0);
+  const REQUEST_SOFT_LIMIT = 15; // show rest alert after N requests
 
-  const personas = useLiveQuery(() => db.personas.toArray());
-  const activePersona = personas?.find(p => p.id === activePersonaId);
-  
-  // TTS State
+  const conversationHistory = useRef<{ role: 'user' | 'model'; text: string }[]>([]);
   const synthRef = useRef<SpeechSynthesis | null>(null);
-  const [isSpeaking, setIsSpeaking] = useState(false);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const sttWorkerRef = useRef<Worker | null>(null);
+  const personas = useLiveQuery(() => db.personas.toArray());
+  const activePersona = personas?.find(p => p.name === 'English Coach');
 
   useEffect(() => {
     synthRef.current = window.speechSynthesis;
     seedDatabase();
-    // Load settings from Firebase on first mount
-    loadSettingsFromFirebase().then((settings) => {
-      if (settings) {
-        if (settings.modelTier) setModelTier(settings.modelTier);
-        if (settings.selectedVoiceURI) setVoiceURI(settings.selectedVoiceURI);
-        if (settings.pushToTalk !== undefined) setIsPTT(settings.pushToTalk);
-      }
+
+    loadSettingsFromFirebase().then((s) => {
+      if (s?.selectedVoiceURI) setSelectedGeminiVoice(s.selectedVoiceURI);
+      if (s?.pushToTalk !== undefined) setIsPTT(s.pushToTalk);
     });
+
+    const worker = new Worker(new URL('../lib/sttWorker.ts', import.meta.url), { type: 'module' });
+    worker.onmessage = (e) => {
+      if (e.data.type === 'transcript') handleTranscription(e.data.text);
+    };
+    worker.postMessage({ type: 'load', model: 'Xenova/whisper-tiny.en' });
+    sttWorkerRef.current = worker;
+
+    return () => worker.terminate();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Auto-save settings to Firebase whenever any setting changes
   useEffect(() => {
-    saveSettingsToFirebase({
-      selectedPersona: activePersona?.name ?? 'English Coach',
-      selectedVoiceURI: voiceURI,
-      modelTier,
-      pushToTalk: isPTT,
-    });
-  }, [modelTier, voiceURI, isPTT, activePersona]);
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
 
-  const handleSetup = async () => {
-    setIsSettingUp(true);
-    try {
-      setLoadingMsg('Requesting WebGPU access...');
-      const nav = navigator as any;
-      if (!nav.gpu) {
-        throw new Error("WebGPU is not supported by your browser. Please use Chrome, Edge, or Firefox (with flags) on a compatible device.");
-      }
-      
-      const adapter = await nav.gpu.requestAdapter();
-      if (!adapter) throw new Error("Could not get WebGPU adapter.");
-      
-      // Auto tier selection based on memory
-      let selectedTier = 'Balanced';
-      if (nav.deviceMemory) {
-        if (nav.deviceMemory <= 4) selectedTier = 'Fast';
-        if (nav.deviceMemory >= 8) selectedTier = 'Best';
-      }
-      setModelTier(selectedTier);
-      
-      setLoadingMsg(`Loading LLM (${selectedTier} Tier)...`);
-      const selectedModel = MODELS[selectedTier];
-      
-      const engine = await CreateMLCEngine(selectedModel, {
-        initProgressCallback: (info) => {
-          setLoadingMsg(`LLM: ${info.text}`);
-          setDownloadProgress(info.progress * 100);
-        }
-      });
-      engineRef.current = engine;
-      
-      setLoadingMsg('Loading STT Model...');
-      const sttWorker = new Worker(new URL('../lib/sttWorker.ts', import.meta.url), { type: 'module' });
-      sttWorker.onmessage = (e) => {
-        if (e.data.type === 'progress') {
-          setLoadingMsg(e.data.status);
-        } else if (e.data.type === 'ready') {
-          setAppState('idle');
-        } else if (e.data.type === 'result') {
-          handleTranscription(e.data.text);
-        } else if (e.data.type === 'error') {
-          setAppState('error');
-          setErrorMsg(e.data.error);
-        }
-      };
-      
-      sttWorker.postMessage({ type: 'load', model: selectedTier === 'Fast' ? 'Xenova/whisper-tiny.en' : 'Xenova/whisper-base.en' });
-      sttWorkerRef.current = sttWorker;
-      
-    } catch (err: any) {
-      setAppState('error');
-      setErrorMsg(err.message);
-      setIsSettingUp(false);
-    }
+  const speakSentence = (text: string) => {
+    if (!synthRef.current) return;
+    const utt = new SpeechSynthesisUtterance(text);
+    // Map Gemini voice name to closest browser voice
+    const browserVoices = window.speechSynthesis.getVoices();
+    const voiceMap: Record<string, string[]> = {
+      Puck:   ['Google UK English Male', 'en-GB'],
+      Charon: ['Google US English', 'en-US'],
+      Kore:   ['Google UK English Female', 'en-GB'],
+      Fenrir: ['Microsoft David', 'en-US'],
+      Aoede:  ['Samantha', 'en-US'],
+      Orbit:  ['Google US English', 'en-US'],
+      Zephyr: ['Microsoft Zira', 'en-US'],
+    };
+    const preferred = voiceMap[selectedGeminiVoice] || [];
+    const match = browserVoices.find(v => preferred.some(p => v.name.includes(p) || v.lang.startsWith(p)));
+    if (match) utt.voice = match;
+    utt.rate = 1;
+    utt.onstart = () => { setAppState('speaking'); setStatusLabel('Speaking...'); };
+    utt.onend = () => { setAppState('idle'); setStatusLabel('Tap the orb to start'); };
+    synthRef.current.speak(utt);
   };
 
-  const conversationHistory = useRef<{ role: 'user' | 'model'; text: string }[]>([]);
+  const { audioLevel, startListening, stopListening } = useAudioPipeline({
+    continuous: !isPTT,
+    onSilence: (audioBlob) => {
+      if (appState !== 'listening') return;
+      setAppState('thinking');
+      setStatusLabel('Thinking...');
+      sttWorkerRef.current?.postMessage({ type: 'transcribe', audio: audioBlob });
+    },
+  });
+
+  const handleOrbTap = () => {
+    if (appState === 'speaking') {
+      synthRef.current?.cancel();
+      setAppState('idle');
+      setStatusLabel('Tap the orb to start');
+      return;
+    }
+    if (appState === 'listening') {
+      stopListening();
+      setAppState('idle');
+      setStatusLabel('Tap the orb to start');
+      return;
+    }
+    if (appState === 'idle') {
+      startListening();
+      setAppState('listening');
+      setStatusLabel('Listening... speak now');
+    }
+  };
 
   const handleTranscription = async (text: string) => {
     if (!text.trim()) {
       setAppState('idle');
+      setStatusLabel('Tap the orb to start');
       return;
     }
-    
-    setAppState('thinking');
-    const systemPrompt = activePersona?.systemPrompt || 'You are a helpful English coach.';
 
-    // Add user turn to history
+    // Soft limit check
+    const newCount = requestCount + 1;
+    setRequestCount(newCount);
+    if (newCount > REQUEST_SOFT_LIMIT && newCount % 5 === 0) {
+      const msg = REST_MESSAGES[Math.floor(Math.random() * REST_MESSAGES.length)];
+      setRestAlert(msg);
+      setTimeout(() => setRestAlert(null), 5000);
+    }
+
+    const userMsg: Message = { role: 'user', text, ts: Date.now() };
+    setMessages(prev => [...prev, userMsg]);
     conversationHistory.current.push({ role: 'user', text });
 
-    const geminiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+    setAppState('thinking');
+    setStatusLabel('Thinking...');
 
-    if (geminiKey) {
-      // ── Gemini Cloud Path ──────────────────────────────────────────
-      const { streamGeminiResponse } = await import('@/lib/gemini');
-      let sentenceBuffer = '';
-      setAppState('speaking');
+    const systemPrompt = activePersona?.systemPrompt || 'You are a helpful English coach.';
+    let fullReply = '';
+    let sentenceBuffer = '';
 
+    try {
       await streamGeminiResponse(
         conversationHistory.current,
         systemPrompt,
         (token) => {
+          fullReply += token;
           sentenceBuffer += token;
           if (/[.!?\n]\s*/.test(sentenceBuffer)) {
-            const sentences = sentenceBuffer.split(/(?<=[.!?\n])\s+/);
-            for (let i = 0; i < sentences.length - 1; i++) {
-              if (sentences[i].trim()) speakSentence(sentences[i].trim());
+            const parts = sentenceBuffer.split(/(?<=[.!?\n])\s+/);
+            for (let i = 0; i < parts.length - 1; i++) {
+              if (parts[i].trim()) speakSentence(parts[i].trim());
             }
-            sentenceBuffer = sentences[sentences.length - 1];
+            sentenceBuffer = parts[parts.length - 1];
           }
         },
         () => {
           if (sentenceBuffer.trim()) speakSentence(sentenceBuffer.trim());
-          conversationHistory.current.push({ role: 'model', text: sentenceBuffer });
+          conversationHistory.current.push({ role: 'model', text: fullReply });
+          setMessages(prev => [...prev, { role: 'assistant', text: fullReply, ts: Date.now() }]);
         }
       );
-
-    } else {
-      // ── Local WebLLM Fallback ──────────────────────────────────────
-      try {
-        const prompt = `System: ${systemPrompt}\nUser: ${text}\nAssistant:`;
-        const chunks = await engineRef.current.chat.completions.create({
-          messages: [{ role: 'user', content: prompt }],
-          stream: true,
-        });
-        
-        let fullReply = '';
-        let sentenceBuffer = '';
-        setAppState('speaking');
-        
-        for await (const chunk of chunks) {
-          if (appState === 'listening') break;
-          const token = chunk.choices[0]?.delta?.content || '';
-          fullReply += token;
-          sentenceBuffer += token;
-          
-          if (/[.!?\n]\s/.test(sentenceBuffer)) {
-            speakSentence(sentenceBuffer.trim());
-            sentenceBuffer = '';
-          }
-        }
-        
-        if (sentenceBuffer.trim()) speakSentence(sentenceBuffer.trim());
-        conversationHistory.current.push({ role: 'model', text: fullReply });
-
-      } catch (err) {
-        console.error(err);
-        setAppState('idle');
-      }
+    } catch (err: any) {
+      const isRateLimit = err?.message?.includes('429') || err?.message?.includes('quota');
+      const msg = isRateLimit
+        ? REST_MESSAGES[Math.floor(Math.random() * REST_MESSAGES.length)]
+        : "Something went wrong. Please try again.";
+      setRestAlert(msg);
+      setTimeout(() => setRestAlert(null), 6000);
+      setAppState('idle');
+      setStatusLabel('Tap the orb to start');
     }
   };
 
-  const speakSentence = (text: string) => {
-    if (!synthRef.current) return;
-    const utterance = new SpeechSynthesisUtterance(text);
-    
-    if (voiceURI) {
-      const voices = synthRef.current.getVoices();
-      const match = voices.find(v => v.voiceURI === voiceURI);
-      if (match) utterance.voice = match;
-    }
-    
-    utterance.onstart = () => setIsSpeaking(true);
-    utterance.onend = () => {
-      if (!synthRef.current?.pending && !synthRef.current?.speaking) {
-        setIsSpeaking(false);
-        setAppState('idle');
-      }
-    };
-    
-    synthRef.current.speak(utterance);
+  const stateColors: Record<AppState, string> = {
+    idle:     '#6366F1',
+    listening:'#10B981',
+    thinking: '#F59E0B',
+    speaking: '#6366F1',
+    error:    '#EF4444',
   };
 
-  const toggleMic = () => {
-    if (appState === 'listening') {
-      stopListening();
-    } else {
-      // Barge-in
-      if (synthRef.current?.speaking) {
-        synthRef.current.cancel();
-      }
-      setAppState('listening');
-      startListening();
-    }
+  const stateLabels: Record<AppState, string> = {
+    idle:     'Ready',
+    listening:'Listening',
+    thinking: 'Thinking',
+    speaking: 'Speaking',
+    error:    'Error',
   };
-
-  if (appState === 'setup') {
-    return (
-      <div className="flex h-screen w-full items-center justify-center p-6">
-        <div className="max-w-md w-full text-center space-y-6">
-          <div className="w-32 h-32 mx-auto mb-8 rounded-full bg-[var(--accent)] flex items-center justify-center shadow-xl">
-             <Mic className="w-12 h-12 text-white" />
-          </div>
-          <h1 className="text-3xl font-medium">English Coach</h1>
-          <p className="text-[var(--foreground)] opacity-70">A fully offline, local speech-to-speech AI assistant running entirely on your device.</p>
-          
-          <div className="pt-8">
-            <button 
-              onClick={handleSetup}
-              disabled={isSettingUp}
-              className="w-full py-4 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded-full font-medium transition-colors shadow-md disabled:opacity-50"
-            >
-              {isSettingUp ? 'Downloading...' : 'Setup Models (~1.5GB)'}
-            </button>
-            
-            {isSettingUp && (
-              <div className="w-full bg-[var(--surface-dark)] h-2 rounded-full mt-6 overflow-hidden">
-                <div 
-                  className="bg-[var(--accent)] h-full transition-all duration-300 ease-out"
-                  style={{ width: `${downloadProgress}%` }}
-                />
-              </div>
-            )}
-            
-            <p className="text-sm mt-4 text-[var(--foreground)] opacity-50 truncate">{loadingMsg}</p>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (appState === 'error') {
-    return (
-      <div className="flex h-screen w-full items-center justify-center p-6 text-center">
-        <div className="max-w-md space-y-4">
-          <Info className="w-12 h-12 text-red-500 mx-auto" />
-          <h2 className="text-xl font-medium">Unsupported Device</h2>
-          <p className="opacity-70">{errorMsg}</p>
-          <button onClick={() => window.location.reload()} className="mt-4 px-6 py-2 bg-[var(--surface-dark)] rounded-full">Retry</button>
-        </div>
-      </div>
-    );
-  }
 
   return (
-    <div className="flex flex-col h-screen w-full relative overflow-hidden">
-      {/* Header */}
-      <header className="absolute top-0 w-full p-6 flex justify-between items-center z-20">
-        <div className="flex items-center space-x-2 bg-[var(--surface)] px-4 py-2 rounded-full shadow-sm text-sm">
-           <span>{activePersona?.icon}</span>
-           <span className="font-medium">{activePersona?.name}</span>
-        </div>
-        <button 
-          onClick={() => setShowSettings(true)}
-          className="p-3 bg-[var(--surface)] rounded-full shadow-sm hover:bg-[var(--surface-dark)] transition-colors"
-        >
-          <Settings className="w-5 h-5" />
-        </button>
-      </header>
+    <div className="flex flex-col min-h-dvh relative overflow-hidden" style={{ background: 'var(--bg)' }}>
 
-      {/* Main Orb Area */}
-      <main className="flex-1 flex flex-col items-center justify-center">
-        <Orb 
-          state={appState === 'speaking' || appState === 'listening' || appState === 'thinking' || appState === 'idle' ? appState : 'idle'} 
-          audioLevel={audioLevel} 
-          onClick={toggleMic}
-        />
-        
-        <AnimatePresence>
-          {appState === 'listening' && (
-            <motion.div 
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0 }}
-              className="mt-8 text-[var(--accent)] font-medium"
-            >
-              Listening...
-            </motion.div>
-          )}
-          {appState === 'thinking' && (
-            <motion.div 
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0 }}
-              className="mt-8 opacity-50 flex items-center space-x-2"
-            >
-              <Loader2 className="w-4 h-4 animate-spin" />
-              <span>Thinking...</span>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </main>
-
-      {/* Bottom Controls (for PTT or Fallback) */}
-      <div className="absolute bottom-8 w-full flex justify-center z-20">
-        <button 
-          onPointerDown={isPTT ? toggleMic : undefined}
-          onPointerUp={isPTT ? toggleMic : undefined}
-          onClick={!isPTT ? toggleMic : undefined}
-          className={`p-6 rounded-full shadow-xl transition-all ${
-            appState === 'listening' 
-              ? 'bg-red-500 scale-95 text-white' 
-              : 'bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white hover:scale-105'
-          }`}
-        >
-           <Mic className="w-8 h-8" />
-        </button>
+      {/* Blue gradient background blobs */}
+      <div className="fixed inset-0 pointer-events-none overflow-hidden" style={{ zIndex: 0 }}>
+        <div style={{
+          position: 'absolute', top: -120, left: -80, width: 400, height: 400,
+          borderRadius: '50%',
+          background: 'radial-gradient(circle, rgba(99,102,241,0.18) 0%, transparent 70%)',
+          filter: 'blur(40px)',
+        }} />
+        <div style={{
+          position: 'absolute', top: 200, right: -100, width: 350, height: 350,
+          borderRadius: '50%',
+          background: 'radial-gradient(circle, rgba(167,139,250,0.15) 0%, transparent 70%)',
+          filter: 'blur(50px)',
+        }} />
+        <div style={{
+          position: 'absolute', bottom: 100, left: -60, width: 300, height: 300,
+          borderRadius: '50%',
+          background: 'radial-gradient(circle, rgba(59,130,246,0.12) 0%, transparent 70%)',
+          filter: 'blur(45px)',
+        }} />
       </div>
 
-      <SettingsSheet 
-        isOpen={showSettings}
-        onClose={() => setShowSettings(false)}
-        activePersonaId={activePersonaId}
-        setActivePersonaId={setActivePersonaId}
-        voiceURI={voiceURI}
-        setVoiceURI={setVoiceURI}
-        modelTier={modelTier}
-        setModelTier={setModelTier}
-        isPTT={isPTT}
-        setIsPTT={setIsPTT}
-      />
+      {/* Header */}
+      <header className="relative z-10 flex items-center justify-between px-5 pt-12 pb-3">
+        <div>
+          <h1 className="text-2xl font-bold gradient-text tracking-tight">English Coach</h1>
+          <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
+            Powered by Gemini AI
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <motion.div
+            key={appState}
+            initial={{ scale: 0.85, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold"
+            style={{ background: `${stateColors[appState]}18`, color: stateColors[appState] }}
+          >
+            <motion.div
+              animate={{ scale: appState === 'idle' ? 1 : [1, 1.4, 1] }}
+              transition={{ duration: 1, repeat: Infinity }}
+              className="w-1.5 h-1.5 rounded-full"
+              style={{ background: stateColors[appState] }}
+            />
+            {stateLabels[appState]}
+          </motion.div>
+          <button
+            onClick={() => setShowSettings(true)}
+            className="w-10 h-10 rounded-2xl flex items-center justify-center glass"
+          >
+            <Settings size={17} style={{ color: 'var(--text-muted)' }} />
+          </button>
+        </div>
+      </header>
+
+      {/* Orb + Wave section */}
+      <section className="relative z-10 flex flex-col items-center pt-2 pb-4 gap-3">
+        <Orb state={appState === 'error' ? 'idle' : appState} audioLevel={audioLevel} onClick={handleOrbTap} />
+
+        {/* AI Wave visualizer */}
+        <AnimatePresence mode="wait">
+          <motion.div
+            key={appState}
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95 }}
+            transition={{ duration: 0.3 }}
+          >
+            <AIWave state={appState === 'error' ? 'idle' : appState} audioLevel={audioLevel} />
+          </motion.div>
+        </AnimatePresence>
+
+        {/* Status */}
+        <motion.p
+          key={statusLabel}
+          initial={{ opacity: 0, y: 4 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="text-sm font-medium"
+          style={{ color: 'var(--text-muted)' }}
+        >
+          {statusLabel}
+        </motion.p>
+
+        {/* Mic button */}
+        <motion.button
+          whileTap={{ scale: 0.9 }}
+          whileHover={{ scale: 1.05 }}
+          onClick={handleOrbTap}
+          className="mt-1 w-16 h-16 rounded-full flex items-center justify-center shadow-xl"
+          style={{
+            background: appState === 'listening'
+              ? 'linear-gradient(135deg, #10B981, #34D399)'
+              : 'linear-gradient(135deg, #6366F1, #A78BFA)',
+            boxShadow: `0 8px 32px ${stateColors[appState]}55`,
+          }}
+        >
+          {appState === 'listening'
+            ? <MicOff size={24} color="white" />
+            : <Mic size={24} color="white" />
+          }
+        </motion.button>
+      </section>
+
+      {/* Chat Messages */}
+      <section className="relative z-10 flex-1 overflow-y-auto px-4 pb-6 space-y-3">
+        {messages.length === 0 ? (
+          <div className="flex flex-col items-center gap-4 pt-2">
+            <div className="grid grid-cols-3 gap-3 w-full max-w-xs">
+              {[
+                { icon: <BookOpen size={18} />, label: 'Level Adaptive', color: '#6366F1' },
+                { icon: <Zap size={18} />, label: 'Instant Fixes', color: '#F59E0B' },
+                { icon: <MessageSquare size={18} />, label: 'Real Topics', color: '#10B981' },
+              ].map((f) => (
+                <motion.div
+                  key={f.label}
+                  whileTap={{ scale: 0.96 }}
+                  className="flex flex-col items-center gap-2 p-3 rounded-2xl text-center glass"
+                >
+                  <span style={{ color: f.color }}>{f.icon}</span>
+                  <span className="text-xs font-medium" style={{ color: 'var(--text-muted)' }}>{f.label}</span>
+                </motion.div>
+              ))}
+            </div>
+            <p className="text-sm text-center" style={{ color: 'var(--text-muted)' }}>
+              Tap the orb to begin your session ✨
+            </p>
+          </div>
+        ) : (
+          <AnimatePresence>
+            {messages.map((msg) => (
+              <motion.div
+                key={msg.ts}
+                initial={{ opacity: 0, y: 16, scale: 0.95 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                transition={{ type: 'spring', stiffness: 220, damping: 22 }}
+                className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+              >
+                {msg.role === 'assistant' && (
+                  <div className="w-7 h-7 rounded-full flex-shrink-0 mr-2 self-end flex items-center justify-center"
+                    style={{ background: 'linear-gradient(135deg, #6366F1, #A78BFA)' }}>
+                    <span style={{ fontSize: 12 }}>✦</span>
+                  </div>
+                )}
+                <div
+                  className="max-w-[78%] px-4 py-3 rounded-2xl text-sm leading-relaxed"
+                  style={msg.role === 'user' ? {
+                    background: 'linear-gradient(135deg, #6366F1, #A78BFA)',
+                    color: 'white',
+                    borderBottomRightRadius: 4,
+                  } : {
+                    background: 'var(--bg-card)',
+                    color: 'var(--text)',
+                    border: '1px solid var(--border)',
+                    borderBottomLeftRadius: 4,
+                  }}
+                >
+                  {msg.text}
+                </div>
+              </motion.div>
+            ))}
+          </AnimatePresence>
+        )}
+        <div ref={chatEndRef} />
+      </section>
+
+      {/* Rest/Limit Alert */}
+      <AnimatePresence>
+        {restAlert && (
+          <motion.div
+            initial={{ y: 100, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: 100, opacity: 0 }}
+            transition={{ type: 'spring', stiffness: 250, damping: 25 }}
+            className="fixed bottom-6 left-4 right-4 z-50 px-4 py-3 rounded-2xl flex items-center gap-3"
+            style={{
+              background: 'linear-gradient(135deg, #6366F1, #A78BFA)',
+              boxShadow: '0 8px 32px rgba(99,102,241,0.4)',
+            }}
+          >
+            <span className="text-xl">💙</span>
+            <p className="text-sm text-white font-medium flex-1">{restAlert}</p>
+            <button onClick={() => setRestAlert(null)}>
+              <X size={16} color="rgba(255,255,255,0.8)" />
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Settings Bottom Sheet */}
+      <AnimatePresence>
+        {showSettings && (
+          <>
+            <motion.div
+              className="fixed inset-0 z-40"
+              style={{ background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)' }}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowSettings(false)}
+            />
+            <motion.div
+              className="fixed bottom-0 left-0 right-0 z-50 rounded-t-3xl px-5 pt-3 pb-10"
+              style={{ background: 'var(--bg-card)', borderTop: '1px solid var(--border)' }}
+              initial={{ y: '100%' }}
+              animate={{ y: 0 }}
+              exit={{ y: '100%' }}
+              transition={{ type: 'spring', stiffness: 280, damping: 30 }}
+            >
+              <div className="w-10 h-1 rounded-full mx-auto mb-5" style={{ background: 'var(--border)' }} />
+
+              <h2 className="text-lg font-bold mb-1" style={{ color: 'var(--text)' }}>Settings</h2>
+              <p className="text-xs mb-5" style={{ color: 'var(--text-muted)' }}>{requestCount} messages in this session</p>
+
+              {/* Gemini Voice Selector */}
+              <label className="block text-xs font-semibold mb-2 tracking-widest" style={{ color: 'var(--text-muted)' }}>
+                GEMINI VOICE
+              </label>
+              <div className="grid grid-cols-2 gap-2 mb-5">
+                {GEMINI_VOICES.map((v) => (
+                  <button
+                    key={v.id}
+                    onClick={() => {
+                      setSelectedGeminiVoice(v.id);
+                      saveSettingsToFirebase({ selectedPersona: 'English Coach', selectedVoiceURI: v.id, modelTier: 'Gemini', pushToTalk: isPTT });
+                    }}
+                    className="px-3 py-2.5 rounded-2xl text-left transition-all"
+                    style={{
+                      background: selectedGeminiVoice === v.id ? 'linear-gradient(135deg, #6366F1, #A78BFA)' : 'var(--bg-card-2)',
+                      border: `1px solid ${selectedGeminiVoice === v.id ? 'transparent' : 'var(--border)'}`,
+                    }}
+                  >
+                    <p className="text-sm font-semibold" style={{ color: selectedGeminiVoice === v.id ? 'white' : 'var(--text)' }}>{v.label}</p>
+                    <p className="text-xs mt-0.5" style={{ color: selectedGeminiVoice === v.id ? 'rgba(255,255,255,0.75)' : 'var(--text-muted)' }}>{v.desc}</p>
+                  </button>
+                ))}
+              </div>
+
+              {/* Push-to-talk */}
+              <div className="flex items-center justify-between py-3 border-t" style={{ borderColor: 'var(--border)' }}>
+                <div>
+                  <p className="text-sm font-semibold" style={{ color: 'var(--text)' }}>Push to Talk</p>
+                  <p className="text-xs" style={{ color: 'var(--text-muted)' }}>Tap & hold mic to record</p>
+                </div>
+                <button
+                  onClick={() => {
+                    const next = !isPTT;
+                    setIsPTT(next);
+                    saveSettingsToFirebase({ selectedPersona: 'English Coach', selectedVoiceURI: selectedGeminiVoice, modelTier: 'Gemini', pushToTalk: next });
+                  }}
+                  className="w-12 h-6 rounded-full relative transition-all"
+                  style={{ background: isPTT ? '#6366F1' : 'var(--border)' }}
+                >
+                  <div
+                    className="absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-all duration-300"
+                    style={{ left: isPTT ? 26 : 2 }}
+                  />
+                </button>
+              </div>
+
+              {/* Clear conversation */}
+              <button
+                onClick={() => { setMessages([]); conversationHistory.current = []; setRequestCount(0); setShowSettings(false); }}
+                className="mt-4 w-full py-3 rounded-2xl text-sm font-semibold transition-colors"
+                style={{ background: 'var(--bg-card-2)', color: 'var(--text)' }}
+              >
+                🗑 Clear Conversation
+              </button>
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
