@@ -7,7 +7,7 @@ const withPWA = require('next-pwa')({
   maximumFileSizeToCacheInBytes: 10 * 1024 * 1024, // 10MB
   runtimeCaching: [
     {
-      urlPattern: /^https:\/\/(unpkg\.com|cdn\.jsdelivr\.net|huggingface\.co)\/.*/i,
+      urlPattern: /^https:\/\/(unpkg\.com|cdn\.jsdelivr\.net)\/.*/i,
       handler: 'CacheFirst',
       options: {
         cacheName: 'external-cdn-cache',
