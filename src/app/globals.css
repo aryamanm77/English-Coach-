@@ -4,22 +4,22 @@
 
 @layer base {
   :root {
-    --background: #F5F1EB;
-    --foreground: #1A1918;
-    --accent: #D96A4A; /* Terracotta */
-    --accent-hover: #C55839;
+    --background: #F0F4F8;
+    --foreground: #101828;
+    --accent: #4F46E5;
+    --accent-hover: #4338CA;
     --surface: #FFFFFF;
-    --surface-dark: #EAE5DE;
+    --surface-dark: #E2E8F0;
   }
 
   @media (prefers-color-scheme: dark) {
     :root {
-      --background: #1A1918;
-      --foreground: #F5F1EB;
-      --accent: #E27B5E;
-      --accent-hover: #D96A4A;
-      --surface: #2A2826;
-      --surface-dark: #151413;
+      --background: #0B0F19;
+      --foreground: #F8FAFC;
+      --accent: #6366F1;
+      --accent-hover: #818CF8;
+      --surface: #1E293B;
+      --surface-dark: #0F172A;
     }
   }
 }
