@@ -35,16 +35,21 @@ export function useAudioPipeline({
     }
     if (processorRef.current) {
       processorRef.current.disconnect();
+      processorRef.current = null;
     }
     if (sourceRef.current) {
       sourceRef.current.disconnect();
+      sourceRef.current = null;
     }
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach(track => track.stop());
+      mediaStreamRef.current = null;
     }
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
       audioContextRef.current.close();
+      audioContextRef.current = null;
     }
+    analyserRef.current = null;
     
     // Combine chunks and trigger callback if there's audio
     if (audioChunksRef.current.length > 0) {
@@ -107,7 +112,7 @@ export function useAudioPipeline({
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
       
       const checkAudioLevel = () => {
-        if (!isListening) return;
+        if (!analyserRef.current) return;
         
         analyser.getByteFrequencyData(dataArray);
         let sum = 0;
